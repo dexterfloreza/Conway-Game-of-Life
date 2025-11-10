@@ -1,4 +1,5 @@
 #include <SFML/Graphics.hpp>
+#include <SFML/Audio.hpp>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -12,61 +13,57 @@
 #include <iomanip>
 #include <sstream>
 #include <iostream>
+#include <cmath>
 
 //
-// ---------- Thread Pool with Work Stealing ----------
+// ---------- Thread Pool ----------
 //
 class ThreadPool {
 public:
-    ThreadPool(size_t numThreads = std::thread::hardware_concurrency()) : stop(false) {
-        for (size_t i = 0; i < numThreads; ++i)
-            workers.emplace_back([this, i]() { workerLoop(i); });
+    ThreadPool(size_t n = std::thread::hardware_concurrency()) : stop(false) {
+        for (size_t i = 0; i < n; ++i)
+            workers.emplace_back([this]() { workerLoop(); });
     }
-
     ~ThreadPool() {
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
+            std::unique_lock<std::mutex> lock(qMutex);
             stop = true;
         }
         cond.notify_all();
-        for (auto& w : workers) w.join();
+        for (auto &t : workers) t.join();
     }
-
     void enqueue(std::function<void()> job) {
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
+            std::unique_lock<std::mutex> lock(qMutex);
             tasks.push(std::move(job));
         }
         cond.notify_one();
     }
-
     void waitAll() {
         std::unique_lock<std::mutex> lock(doneMutex);
-        doneCond.wait(lock, [this]() { return tasks.empty() && (activeWorkers == 0); });
+        doneCond.wait(lock, [this]() { return tasks.empty() && activeWorkers == 0; });
     }
 
 private:
     std::vector<std::thread> workers;
     std::queue<std::function<void()>> tasks;
-    std::mutex queueMutex, doneMutex;
+    std::mutex qMutex, doneMutex;
     std::condition_variable cond, doneCond;
     std::atomic<int> activeWorkers{0};
     bool stop;
 
-    void workerLoop(size_t id) {
+    void workerLoop() {
         while (true) {
             std::function<void()> job;
             {
-                std::unique_lock<std::mutex> lock(queueMutex);
+                std::unique_lock<std::mutex> lock(qMutex);
                 cond.wait(lock, [this]() { return stop || !tasks.empty(); });
                 if (stop && tasks.empty()) return;
                 job = std::move(tasks.front());
                 tasks.pop();
                 ++activeWorkers;
             }
-
             job();
-
             {
                 std::unique_lock<std::mutex> lock(doneMutex);
                 --activeWorkers;
@@ -78,23 +75,23 @@ private:
 };
 
 //
-// ---------- Game of Life Core ----------
+// ---------- LifeAccel ----------
 //
 class LifeAccel {
 public:
-    LifeAccel(int width, int height, int cellSize, ThreadPool& pool)
-        : width(width), height(height), cellSize(cellSize),
-          cols(width / cellSize), rows(height / cellSize),
+    LifeAccel(int w, int h, int c, ThreadPool &p)
+        : width(w), height(h), cellSize(c),
+          cols(w / c), rows(h / c),
           current(rows, std::vector<uint8_t>(cols, 0)),
           next(rows, std::vector<uint8_t>(cols, 0)),
-          threadPool(pool) {}
+          pool(p) {}
 
     void randomize(double fill = 0.25) {
         std::mt19937 rng(std::random_device{}());
-        std::uniform_real_distribution<double> dist(0.0, 1.0);
-        for (auto& row : current)
-            for (auto& c : row)
-                c = (dist(rng) < fill) ? 1 : 0;
+        std::uniform_real_distribution<double> dist(0, 1);
+        for (auto &r : current)
+            for (auto &c : r)
+                c = dist(rng) < fill ? 1 : 0;
     }
 
     void updateParallel() {
@@ -103,37 +100,41 @@ public:
         for (int t = 0; t < nThreads; ++t) {
             int start = t * chunk;
             int end = (t == nThreads - 1) ? rows : start + chunk;
-            threadPool.enqueue([=, this]() {
-                for (int i = start; i < end; ++i) {
+            pool.enqueue([=, this]() {
+                for (int i = start; i < end; ++i)
                     for (int j = 0; j < cols; ++j) {
                         int n = countNeighbors(i, j);
-                        next[i][j] = (current[i][j]) ? (n == 2 || n == 3) : (n == 3);
+                        next[i][j] = current[i][j] ? (n == 2 || n == 3) : (n == 3);
                     }
-                }
             });
         }
-        threadPool.waitAll();
+        pool.waitAll();
         current.swap(next);
     }
 
-    void draw(sf::RenderWindow& window) const {
+    void draw(sf::RenderWindow &win) const {
         sf::RectangleShape cell(sf::Vector2f(cellSize - 1, cellSize - 1));
-        for (int i = 0; i < rows; ++i) {
-            for (int j = 0; j < cols; ++j) {
+        cell.setFillColor(sf::Color(80, 200, 255));
+        for (int i = 0; i < rows; ++i)
+            for (int j = 0; j < cols; ++j)
                 if (current[i][j]) {
                     cell.setPosition(j * cellSize, i * cellSize);
-                    cell.setFillColor(sf::Color(80, 200, 255));
-                    window.draw(cell);
+                    win.draw(cell);
                 }
-            }
-        }
+    }
+
+    int getLiveCount() const {
+        int c = 0;
+        for (auto &r : current)
+            for (auto v : r)
+                c += v;
+        return c;
     }
 
 private:
-    int width, height, cellSize;
-    int cols, rows;
+    int width, height, cellSize, cols, rows;
     std::vector<std::vector<uint8_t>> current, next;
-    ThreadPool& threadPool;
+    ThreadPool &pool;
 
     int countNeighbors(int x, int y) const {
         int c = 0;
@@ -149,84 +150,209 @@ private:
 };
 
 //
-// ---------- Timing Utilities ----------
+// ---------- Simulation Metrics ----------
 //
-struct Timer {
-    std::chrono::steady_clock::time_point start;
-    void tic() { start = std::chrono::steady_clock::now(); }
-    double toc() const {
-        auto end = std::chrono::steady_clock::now();
-        return std::chrono::duration<double, std::milli>(end - start).count();
-    }
+struct SimulationMetrics {
+    double fps = 0, avgFps = 0, updateMs = 0, frameMs = 0;
+    int live = 0, delta = 0;
+    long long gen = 0;
 };
 
+void updateMetricsWindow(sf::RenderWindow &win, const SimulationMetrics &m, sf::Font &font) {
+    win.clear(sf::Color(20, 20, 30));
+    sf::Text h("SIMULATION METRICS", font, 20);
+    h.setFillColor(sf::Color(255, 200, 0));
+    h.setPosition(20, 10);
+    win.draw(h);
+
+    std::ostringstream s;
+    s << std::fixed << std::setprecision(1)
+      << "FPS: " << m.fps << " (" << m.avgFps << " avg)\n"
+      << "Update: " << m.updateMs << " ms\n"
+      << "Frame: " << m.frameMs << " ms\n"
+      << "Live Cells: " << m.live << "\n"
+      << "Δ Cells: " << m.delta << "\n"
+      << "Generation: " << m.gen;
+    sf::Text body(s.str(), font, 16);
+    body.setFillColor(sf::Color(180, 220, 255));
+    body.setPosition(20, 50);
+    win.draw(body);
+    win.display();
+}
+
 //
-// ---------- Main Simulation ----------
+// ---------- Pixel DNA Renderer ----------
+//
+void drawPixelDNA(sf::RenderWindow &window, sf::Vector2f pos, float scale, float time) {
+    sf::Color blue(0, 170, 255);
+    sf::Color green(90, 230, 120);
+    sf::Color white(240, 240, 255);
+
+    const int height = 30;
+    const int segments = 32;
+    const float wavelength = 10.0f;
+    const float amplitude = 6.0f;
+
+    // two smooth curves
+    sf::VertexArray left(sf::LineStrip, segments);
+    sf::VertexArray right(sf::LineStrip, segments);
+
+    for (int i = 0; i < segments; ++i) {
+        float x = i * wavelength * scale * 0.1f;
+        float y = std::sin((i * 0.5f) + time * 2.f) * amplitude * scale;
+
+        left[i].position = {pos.x + x, pos.y + y};
+        right[i].position = {pos.x + x, pos.y - y};
+        left[i].color = blue;
+        right[i].color = green;
+    }
+
+    // horizontal rungs
+    for (int i = 0; i < segments; i += 2) {
+        sf::Vertex line[] = {
+            sf::Vertex(left[i].position, white),
+            sf::Vertex(right[i].position, white)
+        };
+        window.draw(line, 2, sf::Lines);
+    }
+
+    window.draw(left);
+    window.draw(right);
+}
+
+
+//
+// ---------- Title Screen ----------
+//
+void showTitleScreen(sf::RenderWindow &win) {
+    sf::Music mus;
+    if (mus.openFromFile("title_conway.mp3")) {
+        mus.setLoop(true);
+        mus.setVolume(60);
+        mus.play();
+    }
+
+    sf::Font f;
+    if (!f.loadFromFile("VCR_OSD_MONO_1.001.ttf")) {
+        std::cerr << "Font not found!\n";
+        return;
+    }
+
+    sf::Text title("CONWAY'S\nGAME OF LIFE", f, 64);
+    title.setFillColor(sf::Color(255, 230, 0));
+    title.setStyle(sf::Text::Bold);
+    title.setLetterSpacing(2);
+    title.setPosition(
+        (win.getSize().x - title.getGlobalBounds().width) / 2,
+        (win.getSize().y - title.getGlobalBounds().height) / 2 - 40);
+
+    sf::Text shadow = title;
+    shadow.setFillColor(sf::Color(200, 0, 0));
+    shadow.move(6, 6);
+
+    sf::Text sub("Press ENTER to begin", f, 24);
+    sub.setPosition(
+        (win.getSize().x - sub.getGlobalBounds().width) / 2,
+        title.getPosition().y + title.getGlobalBounds().height + 100);
+
+    sf::Clock sfClock;
+    bool fadeOut = false;
+    float fadeTime = 1.5f;
+
+    while (win.isOpen()) {
+        sf::Event e;
+        while (win.pollEvent(e)) {
+            if (e.type == sf::Event::Closed) win.close();
+            if (e.type == sf::Event::KeyPressed && e.key.code == sf::Keyboard::Enter) {
+                fadeOut = true;
+                sfClock.restart();
+            }
+        }
+
+        float el = sfClock.getElapsedTime().asSeconds();
+        float alpha = fadeOut ? std::max(0.f, 255.f - el / fadeTime * 255.f)
+                              : std::min(255.f, el / fadeTime * 255.f);
+        if (fadeOut && alpha <= 0.1f) {
+            mus.stop();
+            return;
+        }
+        if (mus.getStatus() == sf::Music::Playing && fadeOut)
+            mus.setVolume(60.f * (alpha / 255.f));
+
+        auto setA = [&](sf::Text &t, int a) {
+            auto c = t.getFillColor(); c.a = a; t.setFillColor(c);
+        };
+        setA(title, (int)alpha);
+        setA(shadow, (int)alpha);
+        float pulse = std::sin(el * 3) * 0.5f + 0.5f;
+        setA(sub, std::min((int)(pulse * 255), (int)alpha));
+
+        win.clear(sf::Color(10, 10, 40));
+        win.draw(shadow);
+        win.draw(title);
+
+        // Draw the pixel DNA below the title
+        sf::Vector2f dnaPos(
+            (win.getSize().x - 7 * 6.f) / 2.f,
+            title.getPosition().y + title.getGlobalBounds().height + 40
+        );
+        float t = sfClock.getElapsedTime().asSeconds();
+        drawPixelDNA(win, {win.getSize().x / 2.f - 24, win.getSize().y / 2.f + 50}, 6.f, t);
+
+        win.draw(sub);
+        win.display();
+    }
+}
+
+//
+// ---------- Main ----------
 //
 int main() {
-    constexpr int WIDTH = 1280;
-    constexpr int HEIGHT = 720;
-    constexpr int CELL = 4;
-    constexpr int TARGET_FPS = 60;
+    constexpr int W = 1280, H = 720, CELL = 4, FPS = 60;
+    sf::RenderWindow win(sf::VideoMode(W, H), "LifeAccel — Conway's Game of Life");
+    win.setFramerateLimit(FPS);
+
+    sf::RenderWindow metrics(sf::VideoMode(320, 240), "Metrics Dashboard");
+    metrics.setPosition({1320, 100});
+
+    showTitleScreen(win);
 
     ThreadPool pool;
-    LifeAccel life(WIDTH, HEIGHT, CELL, pool);
+    LifeAccel life(W, H, CELL, pool);
     life.randomize(0.3);
 
-    // ✅ SFML 2.x version
-    sf::RenderWindow window(sf::VideoMode(WIDTH, HEIGHT), "LifeAccel — Firmware-Class Game of Life");
-    window.setFramerateLimit(TARGET_FPS);
-
     sf::Font font;
-    // ✅ SFML 2.x: loadFromFile
-    if (!font.loadFromFile("arial.ttf")) {
-        std::cerr << "Warning: Font not found, overlay disabled.\n";
-    }
+    font.loadFromFile("ARIAL.ttf");
 
-    // ✅ SFML 2.x: set font and size manually
-    sf::Text overlay;
-    overlay.setFont(font);
-    overlay.setCharacterSize(16);
-    overlay.setFillColor(sf::Color::White);
+    SimulationMetrics m;
+    int prevLive = 0;
+    sf::Clock frame, update;
 
-    double avgFps = 0.0;
-    int frameCount = 0;
+    while (win.isOpen()) {
+        sf::Event e;
+        while (win.pollEvent(e))
+            if (e.type == sf::Event::Closed) win.close();
+        while (metrics.pollEvent(e))
+            if (e.type == sf::Event::Closed) metrics.close();
 
-    sf::Event event;
-    while (window.isOpen()) {
-        while (window.pollEvent(event)) {
-            if (event.type == sf::Event::Closed)
-                window.close();
-        }
-
-        Timer totalTimer; totalTimer.tic();
-        Timer updateTimer; updateTimer.tic();
+        update.restart();
         life.updateParallel();
-        double updateTime = updateTimer.toc();
+        m.updateMs = update.getElapsedTime().asMilliseconds();
 
-        Timer drawTimer; drawTimer.tic();
-        window.clear(sf::Color::Black);
-        life.draw(window);
-        double drawTime = drawTimer.toc();
+        win.clear(sf::Color::Black);
+        life.draw(win);
+        win.display();
 
-        double frameTime = totalTimer.toc();
-        double fps = 1000.0 / frameTime;
-        avgFps = (avgFps * frameCount + fps) / (frameCount + 1);
-        frameCount++;
+        m.frameMs = frame.restart().asMilliseconds();
+        m.fps = 1000.0 / m.frameMs;
+        m.avgFps = (m.avgFps * m.gen + m.fps) / (m.gen + 1);
+        m.live = life.getLiveCount();
+        m.delta = m.live - prevLive;
+        m.gen++;
+        prevLive = m.live;
 
-        if (!font.getInfo().family.empty()) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(1);
-            oss << "FPS: " << fps << " (" << avgFps << " avg)"
-                << " | Update: " << updateTime << " ms"
-                << " | Draw: " << drawTime << " ms";
-            overlay.setString(oss.str());
-            overlay.setPosition(10.f, 10.f);
-            window.draw(overlay);
-        }
-
-        window.display();
+        if (metrics.isOpen())
+            updateMetricsWindow(metrics, m, font);
     }
-
     return 0;
 }
