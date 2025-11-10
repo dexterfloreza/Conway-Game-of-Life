@@ -1,0 +1,26 @@
+# Build directories
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.cbp
+*.workspace
+*.user
+
+# IDE files
+.idea/
+.vscode/
+
+# Windows junk
+Thumbs.db
+*.obj
+*.exe
+*.dll
+*.pdb
+*.lib
+
+# Logs
+*.log
+
+# OS
+.DS_Store
